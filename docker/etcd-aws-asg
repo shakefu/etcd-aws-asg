@@ -1,0 +1,408 @@
+#! /bin/bash
+
+#######################
+# Environment variables
+export DEBUG=${DEBUG:-}
+export ETCD_CURLOPTS=${ETCD_CURLOPTS:-}
+export ETCD_DATA_DIR=${ETCD_DATA_DIR:-/root/etcd}
+export AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-}
+export AWS_DOMAIN_NAME=${AWS_DOMAIN_NAME:-}
+
+##################
+# Script variables
+
+# Script name
+pkg="etcd-aws-asg"
+# Location (in container filesystem) of output file for peer URIs
+etcd_peers_file_path="/root/etcd-peers"
+# Default the startup timeout to 5 seconds
+api_timeout=${ETCD_STARTUP_TIMEOUT:-5}
+
+
+# Curl the AWS metadata API
+aws_api () {
+    curl --connect-timeout $api_timeout --max-time $api_timeout -s "http://169.254.169.254/$*"
+}
+
+
+# Curl the ETCD API
+etcd_api () {
+    curl $ETCD_CURLOPTS --connect-timeout $api_timeout --max-time $api_timeout -f -s $*
+}
+
+# Colorized output is nice to have
+red () { printf "\033[1;31m%s\033[0m" "$*"; }
+pink () { printf "\033[1;35m%s\033[0m" "$*"; }
+blue () { printf "\033[1;34m%s\033[0m" "$*"; }
+green () { printf "\033[1;32m%s\033[0m" "$*"; }
+drk_green () { printf "\033[0;32m%s\033[0m" "$*"; }
+
+# Output an informative message
+info () {
+    echo "$(blue "$pkg"): $*"
+}
+
+
+if [[ $DEBUG != *"etcd-aws-asg"* && "$DEBUG" != "*" ]]; then
+    # Create file logging debug method
+    debug () {
+        echo "$(blue "$pkg"): $(pink "DEBUG"): $*" > etcd-aws-asg-debug.log
+    } 
+else
+    # Create an actual debug output message
+    debug () {
+        echo "$(blue "$pkg"): $(pink "DEBUG"): $*"
+    }
+fi
+
+
+# Output an error message
+error () {
+    echo "$(blue "$pkg"): $(red "ERROR"): $*"
+}
+
+
+# Checks for a variable being set and outputs an error message otherwise
+check_var () {
+    local name=${1:-}; shift
+    local msg=${1:-}; shift
+    local value=$*
+
+    if [[ ! $value ]]; then
+        debug "$(red "$name")=$value"
+        error $msg
+        exit 1
+    fi
+    debug "$(drk_green "$name")=$value"
+}
+
+
+check_aws_iam_profile () {
+    curl --connect-timeout $api_timeout --max-time $api_timeout \
+        -s -f "http://169.254.169.254/latest/meta-data/iam/info" | jq -r \
+        '.InstanceProfileArn'
+}
+
+
+# Check for AWS credentials which are needed to run this script
+check_aws_credentials () {
+    # Check if we have an IAM profile for this instance
+    local profile_arn=$(check_aws_iam_profile)
+    if [[ $profile_arn ]]; then
+        debug "Using IAM profile $profile_arn"
+        return
+    fi
+    # Check for AWS credentials which are needed for querying for ASG info
+    if [[ ! -f /root/.aws/credentials ]]; then
+        if [[ ! $AWS_ACCESS_KEY_ID || ! $AWS_SECRET_ACCESS_KEY ]]; then
+            info "missing AWS environment variables or credentials file"
+            info "      AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set or "
+            info "      /root/.aws/credentials must exist."
+            exit 1
+        else
+            info "using environment variable credentials"
+        fi
+    else
+        info "using credentials file"
+    fi
+}
+
+
+# Retrieve the current region that we're in
+get_aws_region () {
+    aws_api latest/dynamic/instance-identity/document | jq --raw-output .region
+}
+
+
+# Retrieve the current instance ID
+get_instance_id () {
+    aws_api latest/meta-data/instance-id
+}
+
+
+# Retrieve the current instance IP
+get_instance_ip () {
+    aws_api latest/meta-data/local-ipv4
+}
+
+
+# Retrieve the autoscaling group name for the given instance ID
+get_asg_name () {
+    local instance_id=${1:-}
+    aws autoscaling describe-auto-scaling-groups \
+        | jq --raw-output \
+        ".[] | map(select(.Instances[].InstanceId | contains(\"$instance_id\"))) | .[].AutoScalingGroupName"
+}
+
+
+# Get the IDs in the given autoscaling group
+get_asg_instance_ids () {
+    local group_name=${1:-}
+    aws autoscaling describe-auto-scaling-groups \
+        --auto-scaling-group-name "$group_name" \
+        | jq ".AutoScalingGroups[0].Instances[].InstanceId" | xargs
+}
+
+
+# Get the IPs of the given autoscaling group
+get_asg_instance_ips () {
+    local group_name=${1:-}
+    local instance_ids=$(get_asg_instance_ids "$group_name")
+    aws ec2 describe-instances \
+        --instance-ids $instance_ids \
+        | jq -r ".Reservations[].Instances | map(.NetworkInterfaces[].PrivateIpAddress)[]"
+}
+
+
+# Get the IPs of the given instance IDs
+get_instance_ips () {
+    local instance_ids=$*
+    aws ec2 describe-instances \
+        --instance-ids $instance_ids \
+        | jq -r ".Reservations[].Instances | map(.NetworkInterfaces[].PrivateIpAddress)[]"
+}
+
+
+# Make the given scheme, port and IPs into etcd peer URLs
+make_etcd_peer_urls () {
+    local scheme=${1:-}; shift
+    local port=${1:-}; shift
+    local instance_ips=$*
+
+    # Loop over the IPs we have and compose URIs
+    for ip in $instance_ips; do
+        echo "$scheme://$ip:$port"
+    done
+}
+
+
+# Main script
+main () {
+    info "bootstrapping cluster ..."
+
+    # If the script has already run just exit
+    if [ -f "$etcd_peers_file_path" ]; then
+        error "etcd-peers file $etcd_peers_file_path already created, exiting"
+        exit 0
+    fi
+
+    # Verify we have necessary inputs
+    check_aws_credentials
+
+    # Set our region if it's not specified
+    AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-$(get_aws_region)}
+    check_var "AWS_DEFAULT_REGION" "failed to get region" $AWS_DEFAULT_REGION
+
+    # Allow default client/server ports to be changed if necessary
+    client_port=${ETCD_CLIENT_PORT:-2379}
+    debug "client_port=$client_port"
+    server_port=${ETCD_SERVER_PORT:-2380}
+    debug "server_port=$server_port"
+    etcd_client_scheme=${ETCD_CLIENT_SCHEME:-http}
+    debug "etcd_client_scheme=$etcd_client_scheme"
+    etcd_peer_scheme=${ETCD_PEER_SCHEME:-http}
+    debug "etcd_peer_scheme=$etcd_peer_scheme"
+
+    # ETCD API https://coreos.com/etcd/docs/2.0.11/other_apis.html
+    add_ok=201
+    already_added=409
+    delete_ok=204
+    delete_gone=410
+
+    # Retry N times before giving up
+    retry_times=${RETRY_TIMES:-10}
+    # Add a sleep time to allow etcd client requets to finish
+    wait_time=3
+
+    # Look up the instance ID
+    ec2_instance_id=$(get_instance_id)
+    check_var "ec2_instance_id" "failed to get instance id" $ec2_instance_id
+
+    # Look up the instance IP
+    ec2_instance_ip=$(get_instance_ip)
+    check_var "ec2_instance_ip" "failed to get instance IP address" \
+        $ec2_instance_ip
+
+    # Look up the auto-scaling group name
+    asg_name=$(get_asg_name "$ec2_instance_id")
+    check_var "asg_name" "failed to get auto-scaling group name" $asg_name
+
+    # Get the IDs of the instances in our auto-scaling group
+    asg_instance_ids=$(get_asg_instance_ids "$asg_name")
+    check_var "asg_instance_ids" "failed to get autoscaling group IDs" \
+        $asg_instance_ids
+
+    # Get the IP addresses of the instances
+    asg_instance_ips=$(get_instance_ips $asg_instance_ids)
+    check_var "asg_instance_ips" "failed to get autoscaling group IPs" \
+        $asg_instance_ips
+
+    # Compose the IPs we found into peer URLs
+    etcd_peer_urls=$(make_etcd_peer_urls "$etcd_client_scheme" "$client_port" $asg_instance_ips)
+    check_var "etcd_peer_urls" "unable to find peer urls" $etcd_peer_urls
+
+    etcd_existing_peer_urls=
+    etcd_existing_peer_names=
+    etcd_good_member_url=
+
+    for url in $etcd_peer_urls; do
+        case "$url" in
+            # If we're in proxy mode this is an error, but unlikely to happen?
+            *$ec2_instance_ip*)
+                debug "skipping $url as self";
+                continue;;
+        esac
+
+        debug "querying $url for members"
+        etcd_members=$(etcd_api $url/v2/members)
+
+        if [[ $? == 0 && $etcd_members ]]; then
+            etcd_good_member_url="$url"
+            # debug "etcd_members=$etcd_members"
+            etcd_existing_peer_urls=$(echo "$etcd_members" | jq --raw-output .[][].peerURLs[0])
+            etcd_existing_peer_names=$(echo "$etcd_members" | jq --raw-output .[][].name)
+        break
+        fi
+    done
+
+    debug "etcd_good_member_url=$etcd_good_member_url"
+    debug "etcd_existing_peer_urls="$etcd_existing_peer_urls
+    debug "etcd_existing_peer_names="$etcd_existing_peer_names
+
+    # if I am not listed as a member of the cluster assume that this is a existing cluster
+    if [[ $etcd_existing_peer_urls && $etcd_existing_peer_names != *"$ec2_instance_id"* ]]; then
+        info "joining existing cluster"
+
+        # eject bad members from cluster
+        peer_regexp=$(echo "$etcd_peer_urls" | sed 's/^.*https\{0,1\}:\/\/\([0-9.]*\):[0-9]*.*$/contains(\\"\/\/\1:\\")/' | xargs | sed 's/  */ or /g')
+        check_var "peer_regexp" "failed to create peer regex" $peer_regexp
+
+        bad_peer=$(echo "$etcd_members" | jq --raw-output ".[] | map(select(.peerURLs[] | $peer_regexp | not )) | .[].id")
+        debug "bad_peer=$bad_peer"
+
+        if [[ $bad_peer ]]; then
+            for bp in $bad_peer; do
+                status=0
+                retry=1
+                until [[ $status = $delete_ok || $status =  $delete_gone || $retry = $retry_times ]]; do
+                    status=$(etcd_api -w %{http_code} "$etcd_good_member_url/v2/members/$bp" -XDELETE)
+                    info "removing bad peer $bp, retry $((retry++)), return code $status."
+                    sleep $wait_time
+                done
+                if [[ $status != $delete_ok && $status != $delete_gone ]]; then
+                    error "failed to remove bad peer: $bad_peer, return code $status."
+                    exit 7
+                else
+                    info "removed bad peer: $bad_peer, return code $status."
+                fi
+            done
+        fi
+
+        # We add ourselves as a member to the cluster
+        peer_url="$etcd_peer_scheme://$ec2_instance_ip:$server_port"
+        etcd_initial_cluster=$(etcd_api "$etcd_good_member_url/v2/members" | jq --raw-output '.[] | map(.name + "=" + .peerURLs[0]) | .[]' | xargs | sed 's/  */,/g')$(echo ",$ec2_instance_id=$peer_url")
+        check_var "etcd_initial_cluster" "etcd api to get peers failed" $etcd_initial_cluster
+
+        # join an existing cluster
+        status=0
+        retry=1
+        until [[ $status = $add_ok || $status = $already_added || $retry = $retry_times ]]; do
+            status=$(curl -s -f -w %{http_code} -o /dev/null -XPOST "$etcd_good_member_url/v2/members" -H "Content-Type: application/json" -d "{\"peerURLs\": [\"$peer_url\"], \"name\": \"$ec2_instance_id\"}")
+            info "adding instance ID $ec2_instance_id with peer URL $peer_url, retry $((retry++)), return code $status."
+            sleep $wait_time
+        done
+        if [[ $status != $add_ok && $status != $already_added ]]; then
+            error "unable to add $peer_url to the cluster: return code $status."
+            exit 9
+        else
+            info "added $peer_url to existing cluster, return code $status"
+        fi
+
+        cat > "$etcd_peers_file_path" <<EOF
+ETCD_INITIAL_CLUSTER_STATE=existing
+ETCD_NAME=$ec2_instance_id
+ETCD_INITIAL_CLUSTER="$etcd_initial_cluster"
+EOF
+
+    # otherwise I was already listed as a member so assume that this is a new cluster
+    else
+        # create a new cluster
+        info "creating new cluster"
+
+        # Comma separate our initial cluster URLs
+        etcd_initial_cluster=$(echo $etcd_peer_urls | sed 's/  */,/g')
+        check_var "etcd_initial_cluster" \
+            "unabled to get peers from auto-scaling group" $etcd_initial_cluster
+
+        cat > "$etcd_peers_file_path" <<EOF
+ETCD_INITIAL_CLUSTER_STATE=new
+ETCD_NAME=$ec2_instance_id
+ETCD_INITIAL_CLUSTER="$etcd_initial_cluster"
+EOF
+    fi
+
+
+    # If we are updating DNS, let's do that
+    if [[ ! $AWS_DOMAIN_NAME ]]; then
+        debug "skipping DNS update"
+    else
+        info "updating DNS"
+        debug "AWS_DOMAIN_NAME=$AWS_DOMAIN_NAME"
+
+        record_ips=$(echo "$asg_instance_ips" | jq -R -s -c 'split("\n") | map(select(length > 0)) | map({Value: .})')
+        debug "record_ips=$record_ips"
+
+        # Get the list of hosted zones, and look for one that matches our TLD
+        # (e.g. "staging.internal."), then get the hosted zone ID, and take
+        # everything after the last slash, since it's in the format
+        # "/hostedzone/XXXXX"
+        record_zone=$(aws route53 list-hosted-zones \
+            | jq -r '.HostedZones | map(select(.Name == "'$(echo \
+            "$AWS_DOMAIN_NAME" | grep -Eo "\w+\.\w+[^.]+$")'."))[0].Id' \
+            | grep -Eo '[^/]+$')
+        check_var "record_zone" "failed to get hosted zone" $record_zone
+
+        # Get the current entry for the DNS record
+        record_entry=$(aws route53 list-resource-record-sets \
+            --hosted-zone-id "$record_zone" \
+            --query "ResourceRecordSets[?Name == '$AWS_DOMAIN_NAME.']")
+        # Handle case where domain is not found
+        if [[ "$record_entry" == "[]" ]]; then record_entry=; fi
+        check_var "record_entry" "failed to get record entry" $record_entry
+
+        # Modify the record for upserting changes
+        record_upsert=$(echo "$record_entry" | jq -S '{Changes: [{Action: "UPSERT", ResourceRecordSet: .[0]}]} | .Changes[0].ResourceRecordSet.ResourceRecords = '"$record_ips"' | .Comment = "Automated etcd DNS update"')
+        check_var "record_upsert" "failed to create record upsert" $record_upsert
+
+        # Write the upsert JSON because the AWS CLI needs a file
+        echo "$record_upsert" > etcd-dns.json
+
+        # Update DNS
+        record_update=$(aws route53 change-resource-record-sets --hosted-zone-id "$record_zone" --change-batch file://etcd-dns.json)
+        if [[ $? != 0 ]]; then
+            error "failed to update dns"
+            debug "record_update="$record_update
+            exit 1
+        fi
+
+        info "$(green "dns record updated")"
+    fi
+
+    # If we're here, we're ready to start etcd
+    info "$(green "starting etcd ...")"
+
+    listen_ip=0.0.0.0
+
+    # Inject environment variables (ETCD_*) from etcd-peers file
+    env $(cat $etcd_peers_file_path | xargs) \
+    etcd \
+        --advertise-client-urls $etcd_client_scheme://$ec2_instance_ip:$client_port \
+        --initial-advertise-peer-urls $etcd_peer_scheme://$ec2_instance_ip:$server_port \
+        --listen-client-urls $etcd_client_scheme://$listen_ip:$client_port \
+        --listen-peer-urls $etcd_peer_scheme://$listen_ip:$server_port
+}
+
+
+# Fire 'er up!
+main
+
