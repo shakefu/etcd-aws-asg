@@ -19,17 +19,6 @@ etcd_peers_file_path="/root/etcd-peers"
 api_timeout=${ETCD_STARTUP_TIMEOUT:-5}
 
 
-# Curl the AWS metadata API
-aws_api () {
-    curl --connect-timeout $api_timeout --max-time $api_timeout -s "http://169.254.169.254/$*"
-}
-
-
-# Curl the ETCD API
-etcd_api () {
-    curl $ETCD_CURLOPTS --connect-timeout $api_timeout --max-time $api_timeout -f -s $*
-}
-
 # Colorized output is nice to have
 red () { printf "\033[1;31m%s\033[0m" "$*"; }
 pink () { printf "\033[1;35m%s\033[0m" "$*"; }
@@ -74,6 +63,17 @@ check_var () {
         exit 1
     fi
     debug "$(drk_green "$name")=$value"
+}
+
+# Curl the AWS metadata API
+aws_api () {
+    curl --connect-timeout $api_timeout --max-time $api_timeout -s "http://169.254.169.254/$*"
+}
+
+
+# Curl the ETCD API
+etcd_api () {
+    curl $ETCD_CURLOPTS --connect-timeout $api_timeout --max-time $api_timeout -f -s $*
 }
 
 
