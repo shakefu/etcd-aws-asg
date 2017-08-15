@@ -403,6 +403,80 @@ EOF
 }
 
 
-# Fire 'er up!
-main
+healthcheck () {
+    # Make sure the domain name is set
+    debug "AWS_DOMAIN_NAME=$AWS_DOMAIN_NAME"
+    if [[ ! $AWS_DOMAIN_NAME ]]; then
+        error "Cannot run healthcheck if AWS_DOMAIN_NAME is not set"
+        exit 1
+    fi
+
+
+    # Allow default client ports to be changed if necessary
+    local client_port=${ETCD_CLIENT_PORT:-2379}
+    debug "ETCD_CLIENT_PORT=$client_port"
+
+    local client_scheme=${ETCD_CLIENT_SCHEME:-http}
+    debug "ETCD_CLIENT_SCHEME=$client_scheme"
+
+    local statsd_key=${STATSD_KEY:-etcd.healthcheck}
+    debug "STATSD_KEY=$statsd_key"
+
+    local healthcheck_interval=${HEALTHCHECK_INTERVAL:-10}
+    debug "HEALTHCHECK_INTERVAL=$healthcheck_interval"
+
+    local healthcheck_timeout=${HEALTHCHECK_TIMEOUT:-1}
+    debug "HEALTHCHECK_TIMEOUT=$healthcheck_timeout"
+
+    # Make sure we can exit the script with ctrl+c
+    trap "exit 11" SIGINT SIGTERM
+
+    info "starting healthcheck ..."
+
+    # Loop forever, querying DNS, and pinging those IPs
+    local ping
+    local addresses
+    while true; do
+        sleep $healthcheck_interval
+
+        # Get addresses, one per line
+        addresses=$(nslookup "$AWS_DOMAIN_NAME" 2>/dev/null | grep "^Address" | awk '{print $3}')
+        debug "addresses="$addresses
+        if [[ ! $addresses ]]; then
+            error "failed to get addresses"
+            continue
+        fi
+
+        for ip in $addresses; do
+            # TODO: Figure out netcat syntax
+            debug "Pinging $ip"
+
+            # TODO: Tune this so the timeout is equal to the sleep interval
+            # divided by number of hosts
+            ping=$(curl -f -s --connect-timeout $healthcheck_timeout \
+                --max-time $healthcheck_timeout  -w %{http_code} -o /dev/null \
+                "$client_scheme://$ip:$client_port/health")
+            debug "ping=$ping"
+
+            if [[ "$ping" != 200 ]]; then
+                error "$ip failed ping"
+            else
+                info " $(green "PING"): $ip healthy"
+                echo "$statsd_key:1|c" | nc -u -w0 127.0.0.1 8125
+            fi
+        done
+    done
+
+    exit 0
+}
+
+
+if [[ "$1" == "healthcheck" ]]; then
+    healthcheck
+elif [[ "$1" == "bash" ]]; then
+    bash
+else
+    # Fire 'er up!
+    main
+fi
 
