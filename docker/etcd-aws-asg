@@ -401,6 +401,13 @@ EOF
 
     listen_ip=0.0.0.0
 
+    etcd_cmd="etcd \
+        --advertise-client-urls $etcd_client_scheme://$ec2_instance_ip:$client_port \
+        --initial-advertise-peer-urls $etcd_peer_scheme://$ec2_instance_ip:$server_port \
+        --listen-client-urls $etcd_client_scheme://$listen_ip:$client_port \
+        --listen-peer-urls $etcd_peer_scheme://$listen_ip:$server_port"
+    debug "etcd_cmd="$etcd_cmd
+
     # Inject environment variables (ETCD_*) from etcd-peers file
     env $(cat $etcd_peers_file_path | xargs) \
     etcd \
