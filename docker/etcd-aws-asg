@@ -462,7 +462,7 @@ healthcheck () {
                 error "$ip failed ping"
             else
                 info " $(green "PING"): $ip healthy"
-                echo "$statsd_key:1|c" | nc -u -w0 127.0.0.1 8125
+                echo "$statsd_key:1|c" | nc -u -w1 127.0.0.1 8125
             fi
         done
     done
