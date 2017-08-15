@@ -338,7 +338,7 @@ EOF
         info "creating new cluster"
 
         # Comma separate our initial cluster URLs
-        etcd_initial_cluster=$(aws ec2 describe-instances --instance-ids $instance_ids | jq -r ".Reservations[].Instances | map(.InstanceId + \"=$etcd_peer_scheme://\" + .NetworkInterfaces[].PrivateIpAddress + \":$server_port\")[]" | xargs | sed 's/  */,/g')
+        etcd_initial_cluster=$(aws ec2 describe-instances --instance-ids $asg_instance_ids | jq -r ".Reservations[].Instances | map(.InstanceId + \"=$etcd_peer_scheme://\" + .NetworkInterfaces[].PrivateIpAddress + \":$server_port\")[]" | xargs | sed 's/  */,/g')
         check_var "etcd_initial_cluster" \
             "unabled to get peers from auto-scaling group" $etcd_initial_cluster
 
