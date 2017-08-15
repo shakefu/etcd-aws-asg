@@ -44,5 +44,5 @@ COPY --from=build /usr/bin/aws /usr/local/bin/aws
 COPY etcd-aws-asg /usr/local/bin/etcd-aws-asg
 
 # Our run command
-CMD etcd-aws-asg
+ENTRYPOINT ["/usr/local/bin/etcd-aws-asg"]
 
