@@ -193,6 +193,12 @@ main () {
     AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-$(get_aws_region)}
     check_var "AWS_DEFAULT_REGION" "failed to get region" $AWS_DEFAULT_REGION
 
+    # Turn on auth if needed
+    auth=${ETCD_AUTH}
+    if [[ $auth ]]; then
+        auth="-u $auth"
+    fi
+
     # Allow default client/server ports to be changed if necessary
     client_port=${ETCD_CLIENT_PORT:-2379}
     debug "client_port=$client_port"
@@ -285,7 +291,8 @@ main () {
                 status=0
                 retry=1
                 until [[ $status = $delete_ok || $status =  $delete_gone || $retry = $retry_times ]]; do
-                    status=$(etcd_api -w %{http_code} "$etcd_good_member_url/v2/members/$bp" -XDELETE)
+                    # Inject auth if it is enabled
+                    status=$(etcd_api $auth -w %{http_code} "$etcd_good_member_url/v2/members/$bp" -XDELETE)
                     info "removing bad peer $bp, retry $((retry++)), return code $status."
                     sleep $wait_time
                 done
@@ -307,7 +314,8 @@ main () {
         status=0
         retry=1
         until [[ $status = $add_ok || $status = $already_added || $retry = $retry_times ]]; do
-            status=$(curl -s -f -w %{http_code} -o /dev/null -XPOST "$etcd_good_member_url/v2/members" -H "Content-Type: application/json" -d "{\"peerURLs\": [\"$peer_url\"], \"name\": \"$ec2_instance_id\"}")
+            # Inject auth if it is enabled
+            status=$(curl $auth -s -f -w %{http_code} -o /dev/null -XPOST "$etcd_good_member_url/v2/members" -H "Content-Type: application/json" -d "{\"peerURLs\": [\"$peer_url\"], \"name\": \"$ec2_instance_id\"}")
             info "adding instance ID $ec2_instance_id with peer URL $peer_url, retry $((retry++)), return code $status."
             sleep $wait_time
         done
