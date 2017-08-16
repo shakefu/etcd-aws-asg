@@ -443,7 +443,8 @@ healthcheck () {
     local healthcheck_timeout=${HEALTHCHECK_TIMEOUT:-1}
     debug "HEALTHCHECK_TIMEOUT=$healthcheck_timeout"
 
-    local healthcheck_resolver=${HEALTHCHECK_RESOLVER}
+    local default_resolver=$(grep 'nameserver' /etc/resolv.conf | awk '{print $2}' | head -1)
+    local healthcheck_resolver=${HEALTHCHECK_RESOLVER:-$default_resolver}
     debug "HEALTHCHECK_RESOLVER=$healthcheck_resolver"
 
     # Make sure we can exit the script with ctrl+c
@@ -459,7 +460,8 @@ healthcheck () {
 
         # Get addresses, one per line
         addresses=$(nslookup "$AWS_DOMAIN_NAME" $healthcheck_resolver \
-            2>/dev/null | grep "^Address" | awk '{print $3}')
+            2>/dev/null | grep "^Address" | awk '{print $3}' | \
+            grep -v "^$healthcheck_resolver" )
         debug "addresses="$addresses
         if [[ ! $addresses ]]; then
             error "failed to get addresses"
