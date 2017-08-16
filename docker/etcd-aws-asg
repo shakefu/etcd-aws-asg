@@ -443,6 +443,9 @@ healthcheck () {
     local healthcheck_timeout=${HEALTHCHECK_TIMEOUT:-1}
     debug "HEALTHCHECK_TIMEOUT=$healthcheck_timeout"
 
+    local healthcheck_resolver=${HEALTHCHECK_RESOLVER}
+    debug "HEALTHCHECK_RESOLVER=$healthcheck_resolver"
+
     # Make sure we can exit the script with ctrl+c
     trap "exit 11" SIGINT SIGTERM
 
@@ -455,7 +458,8 @@ healthcheck () {
         sleep $healthcheck_interval
 
         # Get addresses, one per line
-        addresses=$(nslookup "$AWS_DOMAIN_NAME" 2>/dev/null | grep "^Address" | awk '{print $3}')
+        addresses=$(nslookup "$AWS_DOMAIN_NAME" $healthcheck_resolver \
+            2>/dev/null | grep "^Address" | awk '{print $3}')
         debug "addresses="$addresses
         if [[ ! $addresses ]]; then
             error "failed to get addresses"
